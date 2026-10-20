@@ -25,6 +25,9 @@ textarea{width:100%;min-height:120px;border:0;outline:0;resize:vertical;backgrou
 #out{min-height:120px;font-size:1.05rem;line-height:1.5;white-space:pre-wrap;word-break:break-word}
 #out.ph{color:var(--muted)}
 #out.err{color:var(--bad)}
+.alt{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.alt:empty{display:none}
+.alt small{width:100%;color:var(--muted)}
 .mini{border:1px solid var(--line);background:transparent;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:.85rem}
 .go{width:100%;border:0;border-radius:12px;padding:14px;font-weight:600;font-size:1rem;background:var(--accent);color:var(--accent-ink);cursor:pointer;margin-bottom:12px}
 .go:disabled{opacity:.6;cursor:wait}
@@ -52,12 +55,13 @@ button:focus-visible,select:focus-visible{outline:3px solid var(--accent);outlin
 
   <div class="card">
     <div id="out" class="ph">Hasil terjemahan muncul di sini.</div>
+    <div id="alt" class="alt"></div>
     <div class="bar"><span></span>
       <span><button class="mini" id="suara">🔊 Dengar</button> <button class="mini" id="salin">Salin</button></span>
     </div>
   </div>
 
-  <p class="foot">Maksimal 500 karakter per terjemahan. Hasil mesin bisa kurang tepat untuk kalimat rumit.</p>
+  <p class="foot">Maksimal 500 karakter per terjemahan. Kalau hasilnya kurang pas, coba pilihan alternatif di bawah hasil atau pecah teks jadi kalimat pendek.</p>
 </main>
 
 <script>
@@ -69,55 +73,89 @@ const BAHASA = [
   ["de","Jerman"],["fr","Prancis"],["es","Spanyol"],["pt","Portugis"],["it","Italia"],["nl","Belanda"],["sv","Swedia"],["el","Yunani"],["sw","Swahili"]
 ];
 const $ = id => document.getElementById(id);
-const dari = $("dari"), ke = $("ke"), inp = $("in"), out = $("out"), go = $("go");
+const dari = $("dari"), ke = $("ke"), inp = $("in"), out = $("out"), go = $("go"), alt = $("alt");
 
-BAHASA.forEach(([k, n]) => {
-  dari.add(new Option(n, k));
-  ke.add(new Option(n, k));
-});
+dari.add(new Option("Deteksi otomatis", "Autodetect"));
+BAHASA.forEach(([k, n]) => { dari.add(new Option(n, k)); ke.add(new Option(n, k)); });
 dari.value = "id"; ke.value = "en";
 
 let hasil = "";
-function tampil(teks, kelas){
-  out.textContent = teks;
-  out.className = kelas || "";
+function tampil(teks, kelas){ out.textContent = teks; out.className = kelas || ""; }
+function hitung(){ $("cnt").textContent = inp.value.length + " / 500"; }
+const salah = m => Object.assign(new Error(m), {tahu:true});
+
+// Beberapa hasil dari server memuat kode HTML seperti &#39; -> ubah jadi karakter asli
+function dekode(t){ const e = document.createElement("textarea"); e.innerHTML = t; return e.value; }
+
+async function ambil(q){
+  const url = "https://api.mymemory.translated.net/get?q=" + encodeURIComponent(q) +
+              "&langpair=" + encodeURIComponent(dari.value + "|" + ke.value);
+  const r = await fetch(url);
+  const d = await r.json();
+  const t = d && d.responseData && d.responseData.translatedText;
+  if (/MYMEMORY WARNING/i.test(t || "")) throw salah("Kuota terjemahan gratis hari ini habis. Coba lagi besok.");
+  if (!t || Number(d.responseStatus) !== 200) throw salah("Terjemahan gagal. Coba lagi sebentar lagi.");
+  return d;
+}
+
+// Kalau kecocokan memori terjemahan rendah, utamakan hasil mesin (MT)
+function pilih(d){
+  const t = d.responseData.translatedText, skor = Number(d.responseData.match);
+  if (skor >= 0.75 || !Array.isArray(d.matches)) return dekode(t);
+  const mt = d.matches.find(m => m.translation && /MT/i.test(m["created-by"] || ""));
+  return dekode(mt ? mt.translation : t);
+}
+
+function alternatif(d){
+  alt.innerHTML = "";
+  if (!d || !Array.isArray(d.matches)) return;
+  const unik = [...new Set(d.matches.map(m => dekode(m.translation || "")).filter(x => x && x !== hasil))].slice(0, 3);
+  if (!unik.length) return;
+  const k = document.createElement("small"); k.textContent = "Alternatif terjemahan:"; alt.appendChild(k);
+  unik.forEach(u => {
+    const b = document.createElement("button"); b.className = "mini"; b.textContent = u;
+    b.onclick = () => { hasil = u; tampil(u); alternatif(d); };
+    alt.appendChild(b);
+  });
 }
 
 async function terjemah(){
   const q = inp.value.trim();
+  alt.innerHTML = "";
   if (!q) { tampil("Ketik teks dulu ya.", "ph"); hasil = ""; return; }
   if (dari.value === ke.value) { hasil = q; tampil(q); return; }
   go.disabled = true; go.textContent = "Menerjemahkan...";
   try {
-    const url = "https://api.mymemory.translated.net/get?q=" + encodeURIComponent(q) +
-                "&langpair=" + encodeURIComponent(dari.value + "|" + ke.value);
-    const r = await fetch(url);
-    const d = await r.json();
-    const t = d && d.responseData && d.responseData.translatedText;
-    if (!t || /MYMEMORY WARNING/i.test(t) || Number(d.responseStatus) !== 200) {
-      const kuota = /MYMEMORY WARNING/i.test(t || "");
-      throw new Error(kuota ? "Kuota terjemahan gratis hari ini habis. Coba lagi besok." : "Terjemahan gagal. Coba lagi sebentar lagi.");
+    // Pecah per kalimat agar hasil lebih akurat
+    const bagian = (q.match(/[^.!?\n]+[.!?]*/g) || [q]).map(x => x.trim()).filter(Boolean);
+    const hasilBagian = []; let terakhir = null;
+    for (const b of bagian) {
+      terakhir = await ambil(b.slice(0, 500));
+      hasilBagian.push(pilih(terakhir));
     }
-    hasil = t; tampil(t);
+    hasil = hasilBagian.join(" ");
+    tampil(hasil);
+    if (bagian.length === 1) alternatif(terakhir);
   } catch (e) {
     hasil = "";
-    tampil(e.message && e.message.startsWith("Kuota") || e.message.startsWith("Terjemahan") ? e.message : "Tidak bisa terhubung. Cek koneksi internetmu.", "err");
+    tampil(e.tahu ? e.message : "Tidak bisa terhubung. Cek koneksi internetmu.", "err");
   } finally {
     go.disabled = false; go.textContent = "Terjemahkan";
   }
 }
 
 go.onclick = terjemah;
-inp.addEventListener("input", () => { $("cnt").textContent = inp.value.length + " / 500"; });
+inp.addEventListener("input", hitung);
 inp.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) terjemah(); });
 
 $("tukar").onclick = () => {
+  if (dari.value === "Autodetect") return;
   const a = dari.value; dari.value = ke.value; ke.value = a;
-  if (hasil) { inp.value = hasil; $("cnt").textContent = inp.value.length + " / 500"; terjemah(); }
+  if (hasil) { inp.value = hasil; hitung(); terjemah(); }
 };
 
 $("hapus").onclick = () => {
-  inp.value = ""; hasil = ""; $("cnt").textContent = "0 / 500";
+  inp.value = ""; hasil = ""; hitung(); alt.innerHTML = "";
   tampil("Hasil terjemahan muncul di sini.", "ph"); inp.focus();
 };
 
